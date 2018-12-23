@@ -1,0 +1,1111 @@
+﻿#**********************************************************************************************
+# NYC YELLOW CAB ANALYSIS
+#**********************************************************************************************
+#  Load SparkR
+spark_path <- '/usr/local/spark'
+
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = spark_path)
+}
+
+library(SparkR, lib.loc = c(file.path(Sys.getenv("SPARK_HOME"), "R", "lib")))
+
+# Initialise the sparkR session
+sparkR.session(master = "yarn", sparkConfig = list(spark.driver.memory = "1g"))
+
+#Create a Spark DataFrame and examine structure
+pk2015 <- SparkR::read.df("/common_folder/nyc_parking/Parking_Violations_Issued_-_Fiscal_Year_2015.csv", 
+                          "CSV", header="true", inferSchema = "true")
+
+# Check the Spark DataFrame
+head(pk2015)
+colnames(pk2015)
+str(pk2015)
+
+# Rename columns for analysis , replace space by underscore 
+pk2015 <- withColumnRenamed(pk2015, "Registration State", "Registration_State")
+pk2015 <- withColumnRenamed(pk2015, "Vehicle Body Type", "Vehicle_Body_Type")
+pk2015 <- withColumnRenamed(pk2015, "Violation Location", "Violation_Location")
+pk2015 <- withColumnRenamed(pk2015, "Violation Code", "Violation_Code")
+pk2015 <- withColumnRenamed(pk2015, "Violation Precinct", "Violation_Precinct")
+pk2015 <- withColumnRenamed(pk2015, "Issuer Precinct", "Issuer_Precinct")
+pk2015 <- withColumnRenamed(pk2015, "Vehicle Make", "Vehicle_Make")
+pk2015 <- withColumnRenamed(pk2015, "Violation Time", "Violation_Time")
+pk2015 <- withColumnRenamed(pk2015, "Summons Number", "Summons_Number")
+pk2015 <- withColumnRenamed(pk2015, "Issue Date", "Issue_Date")
+pk2015 <- withColumnRenamed(pk2015, "Street Name", "Street_Name")
+
+# Before executing any hive-sql query from RStudio, you need to add a jar file in RStudio 
+sql("ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar")
+
+# For using SQL, you need to create a temporary view
+createOrReplaceTempView(pk2015, "pk2015_tbl")
+#*******************************************************************************************************
+#Examine the data
+#Section 1: Q1- Find the total number of tickets for each year
+count_2015_tkt <- SparkR::sql("SELECT count(*) FROM pk2015_tbl") 
+head(total_2015_tkt) #1,18,09,233 (Total tickets in the 2015 csv file)
+# There are duplicate records for same Summons_Number but since we do not have criterion to decide which records
+#to delete, we will keep all records as is
+
+# Assumption: Consider fiscal year 2015, so consider records of Oct 2014-Sep 2015
+total_2015_tkt <- SparkR::sql("SELECT * FROM pk2015_tbl 
+                              where ((CAST(SUBSTRING(Issue_Date,7,10) AS INT) = 2015)  AND (CAST(SUBSTRING(Issue_Date,1,2) AS INT) NOT in (10,11,12))) OR
+                              ((CAST(SUBSTRING(Issue_Date,7,10) AS INT) = 2014)         AND (CAST(SUBSTRING(Issue_Date,1,2) AS INT) in (10,11,12)))")
+head(total_2015_tkt)
+head(count(total_2015_tkt)) #85,26,076  (Total records in fiscal year : Oct 2014-Sep 2015)
+createOrReplaceTempView(total_2015_tkt, "pk2015_tbl")                                    
+
+
+#*******************************************************************************************************
+#Section 1 : Q2 - Find out the number of unique states from where the cars that got parking tickets came from
+state_tkt_2015 <- SparkR::sql("SELECT count(distinct(Registration_State)) FROM pk2015_tbl") 
+head(state_tkt_2015) #69
+
+state_count_2015 <- summarize(groupBy(total_2015_tkt, total_2015_tkt$Registration_State), count = n(total_2015_tkt$Registration_State))
+head(arrange(state_count_2015, desc(state_count_2015$count))) #NY is highest-6651687
+showDF(state_count_2015, numRows=69 , truncate = TRUE) # 99 is incorrect state, needs to be replaced with NY
+
+tkt_state_99 <- count(filter(total_2015_tkt, total_2015_tkt$Registration_State == "99"))
+head(tkt_state_99) #30679 records
+
+#Below query needs to be corrected, right now all rows updated to state NY--TBD******
+total_2015_tkt <- withColumn(total_2015_tkt, "Registration_State", when(total_2015_tkt$Registration_State == '99', 'NY'))
+head(count(filter(total_2015_tkt, total_2015_tkt$Registration_State == "99"))) #Confirm no state 99
+head(count(total_2015_tkt)) #8526076
+
+createOrReplaceTempView(total_2015_tkt, "pk2015_tbl")
+
+tkt_2015 <- SparkR::sql("SELECT distinct(Registration_State) FROM pk2015_tbl") 
+head(tkt_2015) #68 --- #New count after cleaning state code 99
+
+#*******************************************************************************************************
+#Section 1: Q3 -Write a query to check the number of such tickets that don’t have the address for 
+#violation location on them
+viol_lctn_null_2015 <- SparkR::sql("SELECT count(*) FROM pk2015_tbl where (Violation_Location
+                                   is NULL) OR (Violation_Location = '') ")
+head(viol_lctn_null_2015) #1176914
+#*******************************************************************************************************
+#SECTION 2 : Q1 - How often does each violation code occur? Display the frequency of the top five violation codes.
+tkt_2015 <- SparkR::sql("SELECT * FROM pk2015_tbl")
+viol_cde_2015 <- summarize(groupBy(tkt_2015, tkt_2015$Violation_Code), count = n(tkt_2015$Violation_Code))
+showDF((arrange(viol_cde_2015, desc(viol_cde_2015$count))), numRows = 5, truncate = TRUE)
+#showDF(viol_cde_2015, numRows = 5, truncate = TRUE)
+#  |Violation_Code|  count|
+#  +--------------+-------+
+#  |            21|1186396|
+#  |            38|1046563|
+#  |            14| 731473|
+#  |            36| 633225|
+#  |            37| 582949|
+
+#*******************************************************************************************************
+#SECTION 2 : Q 2A -#How often does each 'vehicle body type' get a parking ticket? 
+viol_veh_bdy_2015 <- summarize(groupBy(tkt_2015, tkt_2015$Vehicle_Body_Type), count = n(tkt_2015$Vehicle_Body_Type))
+showDF((arrange(viol_veh_bdy_2015, desc(viol_veh_bdy_2015$count))), numRows = 5, truncate = TRUE)
+#  +-----------------+-------+                                                     
+#  |Vehicle_Body_Type|  count|
+#  +-----------------+-------+
+#  |             SUBN|2724600|
+#  |             4DSD|2418596|
+#  |              VAN|1234753|
+#  |             DELV| 648066|
+#  |              SDN| 358816|
+#  +-----------------+-------+
+
+#SECTION 2 : Q 2B - How often does each 'vehicle make' get a parking ticket? 
+viol_veh_mke_2015 <- summarize(groupBy(tkt_2015, tkt_2015$Vehicle_Make), count = n(tkt_2015$Vehicle_Make))
+showDF((arrange(viol_veh_mke_2015, desc(viol_veh_mke_2015$count))), numRows = 5, truncate = TRUE)
+#  +------------+-------+                                                          
+#  |Vehicle_Make|  count|
+#  +------------+-------+
+#  |        FORD|1086596|
+#  |       TOYOT| 881606|
+#  |       HONDA| 798107|
+#  |       NISSA| 655635|
+#  |       CHEVR| 641700|
+#  +------------+-------+
+
+#*******************************************************************************************************
+#SECTION 2 : Q 3A - Find the (5 highest) frequency of tickets for'Violation Precinct' (where the violation occurred)
+viol_precinct_2015 <- summarize(groupBy(tkt_2015, tkt_2015$Violation_Precinct), count = n(tkt_2015$Violation_Precinct))
+showDF((arrange(viol_precinct_2015, desc(viol_precinct_2015$count))), numRows = 6, truncate = TRUE)
+#  +------------------+-------+                                                    
+#  |Violation_Precinct|  count|
+#  +------------------+-------+
+#  |                 0|1176914| <Ignore value 0 as top violator precinct, use below ones as top5>
+#  |                19| 445783|
+#  |                18| 304991|
+#  |                14| 295729|
+#  |                 1| 243628|
+#  |               114| 238611|
+#  +------------------+-------+
+
+#SECTION 2 : Q 3B - Find the (5 highest) frequency of tickets for'Issuer Precinct' (this is the precinct that issued the ticket)
+viol_iss_precinct_2015 <- summarize(groupBy(tkt_2015, tkt_2015$Issuer_Precinct), count = n(tkt_2015$Issuer_Precinct))
+showDF((arrange(viol_iss_precinct_2015, desc(viol_iss_precinct_2015$count))), numRows = 6, truncate = TRUE)
+#  +---------------+-------+                                                       
+#  |Issuer_Precinct|  count|
+#  +---------------+-------+
+#  |              0|1354051|<Ignore value 0 as top issuer precinct, use below ones as top5>
+#  |             19| 431900|
+#  |             18| 298599|
+#  |             14| 285318|
+#  |              1| 236432|
+#  |            114| 234238|
+#  +---------------+-------+
+
+#*******************************************************************************************************
+#SECTION 2 : Q 4A - Find the violation code frequency across three precincts which have issued the most number of tickets
+
+#Using violation issuer precinct as 19,18,14  - find the top few violation codes
+
+top3_precints_2015 <- SparkR::sql("SELECT * FROM pk2015_tbl where Issuer_Precinct in (19,18,14)")
+top3_precints_viol_cde_2015 <- summarize(groupBy(top3_precints_2015, top3_precints_2015$Violation_Code), count = n(top3_precints_2015$Violation_Code))
+showDF((arrange(top3_precints_viol_cde_2015, desc(top3_precints_viol_cde_2015$count))), numRows = 10, truncate = TRUE)
+#  +--------------+------+                                                         
+#  |Violation_Code| count|
+#  +--------------+------+
+#  |            14|201700|
+#  |            69|108115|
+#  |            38| 90712|
+#  |            37| 71673|
+#  |            46| 58118|
+#  |            31| 57436|
+#  |            16| 53319|
+#  |            21| 46998|
+#  |            47| 45251|
+#  |            42| 37301|
+#  +--------------+------+
+
+#SECTION 2 : Q 4B  - Are these codes common across precincts?
+
+# Take top few violation codes from issuer precinct (Group 1 - top3 19,18,14) and (Group 2- rest of the codes)
+# Then compare the violation codes of the 2 groups
+other_precints_2015 <- SparkR::sql("SELECT * FROM pk2015_tbl where Issuer_Precinct NOT in (19,18,14)")
+other_precints_viol_cde_2015 <- summarize(groupBy(other_precints_2015, other_precints_2015$Violation_Code), count = n(other_precints_2015$Violation_Code))
+showDF((arrange(other_precints_viol_cde_2015, desc(other_precints_viol_cde_2015$count))), numRows = 10, truncate = TRUE)
+#  +--------------+-------+                                                        
+#  |Violation_Code|  count|
+#  +--------------+-------+
+#  |            21|1139398|
+#  |            38| 955851|
+#  |            36| 633225|
+#  |            14| 529773|
+#  |            37| 511276|
+#  |            20| 455746|
+#  |             7| 430190|
+#  |            71| 403389|
+#  |            46| 380791|
+#  |            40| 365718|
+#  +--------------+-------+
+
+#Comparing the violation codes of 2 groups, it seems that only 38,14 are the only common ones in top 5, rest all
+#seem different
+#*******************************************************************************************************
+#Section 2: Q 5A -parking violations across different times of the day
+head(tkt_2015) #Violation time  0011A, 0318P, 0942A etc
+viol_time_null_2015 <- SparkR::sql("SELECT count(*) FROM pk2015_tbl where Violation_Time IS NULL")
+head(viol_time_null_2015) #1094
+
+# Filter out and use only the records that have violation time not null
+tkt_2015_new <- SparkR::sql("SELECT * FROM pk2015_tbl where Violation_Time IS NOT NULL ")
+head(count(tkt_2015_new)) # 85,24,982 
+createOrReplaceTempView(tkt_2015_new, "pk2015_tbl")
+
+# Section 2 : Q 5B Extract time from Violation Time field 
+tkt_2015_time <- SparkR::sql("SELECT Registration_State, Violation_Code, Violation_Time, SUBSTRING(Violation_Time, 5, 5) AS AMPM,
+                             cast((SUBSTRING(Violation_Time, 1, 2) ) as INT) AS Viol_Hr,
+                             (SUBSTRING(Violation_Time, 3, 4) )AS Viol_Min FROM pk2015_tbl")
+head(tkt_2015_time)
+str(tkt_2015_time)
+createOrReplaceTempView(tkt_2015_time, "tkt_2015_time_tbl")
+
+#Section 2 : Q 5C Create 6 bins for time
+bins <- SparkR::sql("SELECT Registration_State,Violation_Code,AMPM,Viol_Hr, 
+                    CASE WHEN (Viol_Hr >= 8 AND AMPM = 'P')  THEN 6
+                    WHEN  (Viol_Hr >= 4 AND AMPM = 'P') THEN 5
+                    WHEN  (Viol_Hr >= 0 AND AMPM = 'P') THEN 4
+                    WHEN  (Viol_Hr >= 8 AND AMPM = 'A') THEN 3
+                    WHEN  (Viol_Hr >= 4 AND AMPM = 'A') THEN 2
+                    ELSE 1 END  as bin_number FROM tkt_2015_time_tbl")
+head(bins)
+
+# For each of these groups, find the three most commonly occurring violations
+vio_cde_2015 <- summarize(groupBy(bins, bins$bin_number),count = n(bins$bin_number))
+head(arrange(vio_cde_2015, desc(bins$bin_number)))
+#showDF(vio_cde_2015, numRows = 20, truncate = TRUE)
+
+viol_cde_2015_bin1 <- summarize(group_by(filter(bins, bins$bin_number ==1), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin1, desc(viol_cde_2015_bin1$count)), numRows = 3, truncate = TRUE)
+# Bin 1 : 00:00 - 4:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#  |            21|49124|
+#  |            40|29317|
+#  |            78|25916|
+#  +--------------+-----+
+
+viol_cde_2015_bin2 <- summarize(group_by(filter(bins, bins$bin_number ==2), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin2, desc(viol_cde_2015_bin2$count)), numRows = 3, truncate = TRUE)
+# Bin 2 : 04:00 - 08:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#| |           14|107499|
+#  |           21| 84070|
+#  |           40| 74415|
+#  +--------------+-----+
+
+viol_cde_2015_bin3 <- summarize(group_by(filter(bins, bins$bin_number ==3), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin3, desc(viol_cde_2015_bin3$count)), numRows = 3, truncate = TRUE)
+# Bin 3 : 08:00 - 12:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            21|942623|
+# |            38|362355|
+# |            36|298860|
+#  +--------------+-----+
+
+viol_cde_2015_bin4 <- summarize(group_by(filter(bins, bins$bin_number ==4), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin4, desc(viol_cde_2015_bin4$count)), numRows = 3, truncate = TRUE)
+# Bin 4 : 12:00 - 04:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|341349|
+# |            37|256656|
+# |            36|189331|
+# +--------------+------+
+
+viol_cde_2015_bin5 <- summarize(group_by(filter(bins, bins$bin_number ==5), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin5, desc(viol_cde_2015_bin5$count)), numRows = 3, truncate = TRUE)
+# Bin 5 : 04:00 - 08:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|185678|
+# |            37|132260|
+# |            14|117129|
+#  +--------------+-----+
+
+viol_cde_2015_bin6 <- summarize(group_by(filter(bins, bins$bin_number ==6), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2015_bin6, desc(viol_cde_2015_bin6$count)), numRows = 3, truncate = TRUE)
+# Bin 6 : 08:00 PM - 12:00 AM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|154524|
+# |            21|106700|
+# |            37| 88825|
+#  +--------------+-----+
+
+# Section 2 : Q 5D - For the 3 most commonly occurring violation codes, find the most common time of the day(bin)
+vio_cde_2015 <- summarize(groupBy(bins, bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(vio_cde_2015, desc(vio_cde_2015$count)), numRows = 3, truncate = TRUE)
+#  +--------------+-------+                                                        
+#  |Violation_Code|  count|
+#  +--------------+-------+
+#  |            21|1186396|
+#  |            38|1046563|
+#  |            14| 731473|
+#  +--------------+-------+
+
+viol_cde_2015_time1 <- summarize(group_by(filter(bins, bins$Violation_Code ==21), bins$bin_number),count = n(bins$bin_number))
+showDF(arrange(viol_cde_2015_time1, desc(viol_cde_2015_time1$count)), numRows = 1, truncate = TRUE)
+# Bin 3 : 942623 [8 AM -12 PM]
+
+viol_cde_2015_time2 <- summarize(group_by(filter(bins, bins$Violation_Code ==38), bins$bin_number),count = n(bins$bin_number))
+showDF(arrange(viol_cde_2015_time2, desc(viol_cde_2015_time2$count)), numRows = 1, truncate = TRUE)
+# Bin 3 : 362355 [8 AM -12 PM]
+
+viol_cde_2015_time3 <- summarize(group_by(filter(bins, bins$Violation_Code ==14), bins$bin_number),count = n(bins$bin_number))
+showDF(arrange(viol_cde_2015_time3, desc(viol_cde_2015_time3$count)), numRows = 3, truncate = TRUE)
+# Bin 3 : 239301 [8 AM -12 PM]
+
+#*******************************************************************************************************
+# find some seasonality in this data
+# SECTION 2 : Q6- A: Find frequencies of tickets for each season
+str(pk2015)
+head(pk2015) # Issue Date in form 11/20/2014
+#Dividing in 4 seasons : Spring :Mar-May; Summer:June-Aug, Fall -Sep-Nov, Winter- Dec, Feb
+
+bins_seasons <- SparkR::sql("SELECT Registration_State,Violation_Code,Issue_Date, 
+                            CASE WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (3,4,5))  THEN 1
+                            WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (6,7,8))  THEN 2
+                            WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (9,10,11))  THEN 3
+                            ELSE 4 END  as bins_seasons_number FROM pk2015_tbl")
+head(bins_seasons)
+viol_cde_2015_season1 <- summarize(group_by(bins_seasons, bins_seasons$bins_seasons_number),count = n(bins_seasons$bins_seasons_number))
+head(viol_cde_2015_season1)
+#bins_seasons_number   count                                                   
+#                   1 2860647
+#                   3 1764854
+#                   4 2895497
+#                   2 1003984
+
+# Section 2 : Q 6B  - find the three most common violations for each of these seasons
+viol_cde_2015_seasons_bin1 <- summarize(group_by(filter(bins_seasons, bins_seasons$bins_seasons_number ==1), bins_seasons$Violation_Code),count = n(bins_seasons$Violation_Code))
+showDF(arrange(viol_cde_2015_seasons_bin1, desc(viol_cde_2015_seasons_bin1$count)), numRows = 3, truncate = TRUE)
+#  +--------------+------+                                                         
+#  |Violation_Code| count|
+#  +--------------+------+
+#  |            21|425164|
+#  |            38|327048|
+#  |            14|243624|
+#  +--------------+------+
+
+#*******************************************************************************************************
+#Section 2: Q7 - Find total occurrences of the three most common violation codes
+top3_vio_cde_2015 <- summarize(groupBy(tkt_2015_new, tkt_2015_new$Violation_Code),count = n(tkt_2015_new$Violation_Code))
+showDF(arrange(top3_vio_cde_2015, desc(top3_vio_cde_2015$count)), numRows = 3, truncate = TRUE)
+#  +--------------+-------+                                                        
+#  |Violation_Code|  count|
+#  +--------------+-------+
+#  |            21|1186396| Avg Fine = $55 - No parking where parking is not allowed
+#  |            38|1046563| Avg fine = $50 - Parking meter-Failing to show a receipt or tag in the windshield
+#  |            14| 731473| Avg fine = $115 -Standing or parking where standing is not allowed
+#  +--------------+-------+
+
+#find the total amount collected for the three violation codes with maximum tickets
+#State the code which has the highest total collection
+#The code below is not working, to be fixed ---TBD********
+fine_2015_topviol1 <-  summarize(filter(tkt_2015_new, tkt_2015_new$Violation_Code==21), count= n(tkt_2015_new$Violation_Code))
+head(fine_2015_topviol1)
+fine_2015_topviol1.select("count").show()
+
+#*******************************************************************************************************
+
+sparkR.session.stop()
+
+#### Year 2016
+
+spark_path <- '/usr/local/spark'
+
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = spark_path)
+}
+
+library(SparkR, lib.loc = c(file.path(Sys.getenv("SPARK_HOME"), "R", "lib")))
+
+# Initialise the sparkR session
+sparkR.session(master = "yarn-client", sparkConfig = list(spark.driver.memory = "1g"))
+
+
+ Ticket_2016<- read.df("/common_folder/nyc_parking/Parking_Violations_Issued_-_Fiscal_Year_2016.csv",
+                    source = "csv",
+                    header = TRUE, inferSchema = TRUE)
+
+ str(Ticket_2016)
+ 
+# No. of rows
+nrow(Ticket_2016) #10626899
+ 
+# No. of columns
+ ncol(Ticket_2016) #51
+# Getting Column names  
+colnames(Ticket_2016)
+
+#changing column names as few of them are long and have space in between which 
+#might cause problem in fruther evaluation
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Violation In Front Of Or Opposite","Violation_In_Front_Of_Or_Opposite")
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Date First Observed","Date_First_Observed")
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Days Parking In Effect    ","Days_Parking_In_Effect") #contains extra space which is not helpful
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Unregistered Vehicle?","Unregistered_Vehicle")        #? seems to be add so removing it 
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"No Standing or Stopping Violation","No_Standing_or_Stopping_Violation")
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Registration State","Registration_State")
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Violation Location","Violation_Location")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Violation Code", "Violation_Code")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Violation Precinct", "Violation_Precinct")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Issuer Precinct", "Issuer_Precinct")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Vehicle Make", "Vehicle_Make")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Violation Time", "Violation_Time")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Summons Number", "Summons_Number")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Issue Date", "Issue_Date")
+Ticket_2016 <-withColumnRenamed(Ticket_2016, "Street Name", "Street_Name")
+Ticket_2016 <-withColumnRenamed(Ticket_2016,"Vehicle Body Type","Vehicle_Body_Type")
+
+
+###
+##Verifying column name after rename
+colnames(Ticket_2016)
+
+
+ # Before executing any hive-sql query from RStudio, you need to add a jar file in RStudio 
+ sql("ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar")
+ 
+ # For using SQL, you need to create a temporary view
+ createOrReplaceTempView(Ticket_2016, "Ticket_2016_tem")
+ 
+ ##Total no. of tickets for year 2016
+ results <- SparkR::sql("select count(*) from Ticket_2016_tem")
+ head(results)
+ 
+state <-SparkR::sql("select count(distinct(Registration_State)) from Ticket_2016_tem")
+head(state)
+##no. of unique states 68 for year 2016
+
+result_2016  <- SparkR::sql("SELECT * FROM Ticket_2016_tem")
+state_count_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Registration_State), count = n(Ticket_2016$Registration_State))
+head(arrange(state_count_2016, desc(state_count_2016$count))) 
+##NY has highest count 
+
+showDF(state_count_2016, numRows = 68, truncate = TRUE) # 99 is incorrect state, needs to be replaced with NY
+###count of 99 in data is 41585 , 99 will be replaced by NY  
+
+tkt_state_99 <- count(filter(Ticket_2016, Ticket_2016$Registration_State == "99"))
+head(tkt_state_99) #30679 records
+
+#Below query needs to be corrected, right now all rows updated to state NY--TBD******
+Ticket_2016 <- withColumn(Ticket_2016, "Registration_State", when(Ticket_2016$`Registration_State` == "99", "NY"))
+head(count(filter(Ticket_2016, Ticket_2016$Registration_State == "99"))) #Confirm no state 99
+head(count(Ticket_2016)) #8526076
+
+
+tkt_2016 <- SparkR::sql("SELECT distinct(Registration_State) FROM Ticket_2016_tem") 
+head(tkt_2016) #68 --- #New count after cleaning state code 99
+
+
+
+#Write a query to check the number of such tickets that don’t have the address for violation location on them
+lctn_voilation_2016 <- SparkR::sql("SELECT count(*) FROM Ticket_2016_tem where (Violation_Location
+                                   is NULL) OR (Violation_Location = '') ")
+head(lctn_voilation_2016) #1868656
+
+#How often does each violation code occur? Display the frequency of the top five violation codes.
+viol_cde_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Violation_Code), count = n(Ticket_2016$Violation_Code))
+showDF((arrange(viol_cde_2016, desc(viol_cde_2016$count))), numRows = 5, truncate = TRUE)
+##+--------------+-------+                                                        
+##  |Violation_Code|  count|
+##  +--------------+-------+
+##  |            21|1531587|
+##  |            36|1253512|
+##  |            38|1143696|
+##  |            14| 875614|
+##  |            37| 686610|
+##  +--------------+-------+
+###How often does each 'vehicle body type' get a parking ticket? 
+viol_vehicle_type_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Vehicle_Body_Type), count = n(Ticket_2016$Vehicle_Body_Type))
+showDF((arrange(viol_vehicle_type_2016, desc(viol_vehicle_type_2016$count))), numRows = 5, truncate = TRUE)
+##+-----------------+-------+                                                     
+##  |Vehicle_Body_Type|  count|
+##  +-----------------+-------+
+##  |             SUBN|3466037|
+##  |             4DSD|2992107|
+##  |              VAN|1518303|
+##  |             DELV| 755282|
+##  |              SDN| 424043|
+##  +-----------------+-------+
+
+### How often does each 'vehicle make' get a parking ticket? 
+
+viol_vehicle_mke_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Vehicle_Make), count = n(Ticket_2016$Vehicle_Make))
+showDF((arrange(viol_vehicle_mke_2016, desc(viol_vehicle_mke_2016$count))), numRows = 5, truncate = TRUE)
+##+------------+-------+                                                          
+##  |Vehicle_Make|  count|
+## +------------+-------+
+##  |        FORD|1324774|
+##  |       TOYOT|1154790|
+##  |       HONDA|1014074|
+##  |       NISSA| 834833|
+##  |       CHEVR| 759663|
+##  +------------+-------+
+
+##Find the (5 highest) frequency of tickets for'Violation Precinct' (where the violation occurred)
+
+violation_precinct_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Violation_Precinct), count = n(Ticket_2016$Violation_Precinct))
+showDF((arrange(violation_precinct_2016, desc(violation_precinct_2016$count))), numRows = 6, truncate = TRUE)
+##+------------------+-------+                                                    
+##  |Violation_Precinct|  count|
+##  +------------------+-------+
+##  |                 0|1868655|
+##  |                19| 554465|
+##  |                18| 331704|
+##  |                14| 324467|
+##  |                 1| 303850|
+##  |               114| 291336|
+##  +------------------+-------+
+
+##Find the (5 highest) frequency of tickets for'Issuer Precinct' (this is the precinct that issued the ticket)
+
+viol_iss_precinct_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Issuer_Precinct), count = n(Ticket_2016$Issuer_Precinct))
+showDF((arrange(viol_iss_precinct_2016, desc(viol_iss_precinct_2016$count))), numRows = 6, truncate = TRUE)
+##+---------------+-------+                                                       
+##  |Issuer_Precinct|  count|
+##  +---------------+-------+
+##  |              0|2140274|
+##  |             19| 540569|
+##  |             18| 323132|
+##  |             14| 315311|
+##  |              1| 295013|
+##  |            114| 286924|
+##  +---------------+-------+
+
+
+##Find the violation code frequency across three precincts which have issued the most number of tickets
+top3_precints_2016 <- SparkR::sql("SELECT * FROM Ticket_2016_tem where Issuer_Precinct in (19,18,14)")
+top3_precints_viol_cde_2016 <- summarize(groupBy(top3_precints_2016, top3_precints_2016$Violation_Code), count = n(top3_precints_2016$Violation_Code))
+showDF((arrange(top3_precints_viol_cde_2016, desc(top3_precints_viol_cde_2016$count))), numRows = 10, truncate = TRUE)
+##+--------------+------+                                                         
+##  |Violation_Code| count|
+##  +--------------+------+
+##  |            14|224025|
+##  |            69|119857|
+##  |            46| 98097|
+##  |            38| 97168|
+##  |            37| 86040|
+##  |            21| 64621|
+##  |            31| 61053|
+##  |            16| 60635|
+##  |            47| 50478|
+##  |            42| 42696|
+##  +--------------+------+
+
+#Are these codes common across precincts?
+other_precints_2016 <- SparkR::sql("SELECT * FROM Ticket_2016_tem  where Issuer_Precinct NOT in (19,18,14)")
+other_precints_viol_cde_2016 <- summarize(groupBy(other_precints_2016, other_precints_2016$Violation_Code), count = n(other_precints_2016$Violation_Code))
+showDF((arrange(other_precints_viol_cde_2016, desc(other_precints_viol_cde_2016$count))), numRows = 10, truncate = TRUE)
+##+--------------+-------+                                                        
+##  |Violation_Code|  count|
+##  +--------------+-------+
+##  |            21|1466966|
+##  |            36|1253511|
+##  |            38|1046528|
+##  |            14| 651589|
+##  |            37| 600570|
+##  |            20| 569831|
+##  |             7| 492477|
+##  |            46| 482424|
+##  |            71| 464877|
+##  |            40| 429212|
+##  +--------------+-------+
+
+#parking violations across different times of the day
+head(Ticket_2016) #Violation time  0011A, 0318P, 0942A etc
+viol_time_null_2016 <- SparkR::sql("SELECT count(*) FROM Ticket_2016_tem where Violation_Time IS NULL")
+head(viol_time_null_2016) #4280
+
+tkt_2016_new <- SparkR::sql("SELECT * FROM Ticket_2016_tem where Violation_Time IS NOT NULL ")
+head(count(tkt_2016_new)) # 85,24,982 
+createOrReplaceTempView(tkt_2016_new, "Ticket_2016_tem")
+
+# Extract time from Violation Time field 
+tkt_2016_time <- SparkR::sql("SELECT Registration_State, Violation_Code, Violation_Time, SUBSTRING(Violation_Time, 5, 5) AS AMPM,
+                             cast((SUBSTRING(Violation_Time, 1, 2) ) as INT) AS Viol_Hr,
+                             (SUBSTRING(Violation_Time, 3, 4) )AS Viol_Min FROM Ticket_2016_tem")
+head(tkt_2016_time)
+str(tkt_2016_time)
+createOrReplaceTempView(tkt_2016_time, "tkt_2016_time_tbl")
+
+#Create 6 bins for time
+bins <- SparkR::sql("SELECT Registration_State,Violation_Code,AMPM,Viol_Hr, 
+                    CASE WHEN (Viol_Hr >= 8 AND AMPM = 'P')  THEN 6
+                    WHEN  (Viol_Hr >= 4 AND AMPM = 'P') THEN 5
+                    WHEN  (Viol_Hr >= 0 AND AMPM = 'P') THEN 4
+                    WHEN  (Viol_Hr >= 8 AND AMPM = 'A') THEN 3
+                    WHEN  (Viol_Hr >= 4 AND AMPM = 'A') THEN 2
+                    ELSE 1 END  as bin_number FROM tkt_2016_time_tbl")
+head(bins)
+
+# For each of these groups, find the three most commonly occurring violations
+vio_cde_2016 <- summarize(groupBy(bins, bins$bin_number),count = n(bins$bin_number))
+head(arrange(vio_cde_2016, desc(bins$bin_number)))
+#showDF(vio_cde_2015, numRows = 20, truncate = TRUE)
+
+viol_cde_2016_bin1 <- summarize(group_by(filter(bins, bins$bin_number ==1), bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(viol_cde_2016_bin1, desc(viol_cde_2016_bin1$count)), numRows = 3, truncate = TRUE)
+##+--------------+-----+                                                          
+##  |Violation_Code|count|
+##  +--------------+-----+
+##  |            21|67799|
+##  |            40|37262|
+##  |            78|29473|
+##  +--------------+-----+
+
+##For the 3 most commonly occurring violation codes, find the most common time of the day(bin)
+vio_cde_2016 <- summarize(groupBy(bins, bins$Violation_Code),count = n(bins$Violation_Code))
+showDF(arrange(vio_cde_2016, desc(vio_cde_2016$count)), numRows = 3, truncate = TRUE)
+##+--------------+-------+                                                        
+##  |Violation_Code|  count|
+##  +--------------+-------+
+##  |            21|1530787|
+##  |            36|1253511|
+##  |            38|1143438|
+##  +--------------+-------+
+
+viol_cde_2016_time1 <- summarize(group_by(filter(bins, bins$Violation_Code ==21), bins$bin_number),count = n(bins$bin_number))
+showDF(arrange(viol_cde_2016_time1, desc(viol_cde_2016_time1$count)), numRows = 3, truncate = TRUE)
+
+##Find frequencies of tickets for each season
+str(Ticket_2016)
+head(Ticket_2016) # Issue Date in form 07/09/2015
+#Dividing in 4 seasons : Spring :Mar-May; Summer:June-Aug, Fall -Sep-Nov, Winter- Dec, Feb
+
+bins_seasons <- SparkR::sql("SELECT Registration_State,Violation_Code,Issue_Date, 
+                            CASE WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (3,4,5))  THEN 1
+                            WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (6,7,8))  THEN 2
+                            WHEN (cast(SUBSTRING(Issue_Date, 1, 2)  as INT) in (9,10,11))  THEN 3
+                            ELSE 4 END  as bins_seasons_number FROM Ticket_2016_tem")
+head(bins_seasons)
+viol_cde_2016_season1 <- summarize(group_by(bins_seasons, bins_seasons$bins_seasons_number),count = n(bins_seasons$bins_seasons_number))
+head(viol_cde_2016_season1)
+#bins_seasons_number   count                                                   
+#1                   1 2790866
+#2                   3 2973044
+#3                   4 2424360
+#4                   2 2434349
+
+# find the three most common violations for each of these seasons
+viol_cde_2016_seasons_bin1 <- summarize(group_by(filter(bins_seasons, bins_seasons$bins_seasons_number ==1), bins_seasons$Violation_Code),count = n(bins_seasons$Violation_Code))
+showDF(arrange(viol_cde_2016_seasons_bin1, desc(viol_cde_2016_seasons_bin1$count)), numRows = 3, truncate = TRUE)
+##+--------------+------+                                                         
+##  |Violation_Code| count|
+##  +--------------+------+
+##  |            21|383752|
+##  |            36|374362|
+##  |            38|299459|
+##  +--------------+------+
+#Find total occurrences of the three most common violation codes
+top3_vio_cde_2016 <- summarize(groupBy(Ticket_2016, Ticket_2016$Violation_Code),count = n(Ticket_2016$Violation_Code))
+showDF(arrange(top3_vio_cde_2016, desc(top3_vio_cde_2016$count)), numRows = 3, truncate = TRUE)
+##+--------------+-------+                                                        
+##  |Violation_Code|  count|
+##  +--------------+-------+
+##  |            21|1531587|
+##  |            36|1253512|
+##  |            38|1143696|
+
+#find the total amount collected for the three violation codes with maximum tickets
+#State the code which has the highest total collection
+#The code below is not working, to be fixed ---TBD********
+fine_2016_topviol1 <-  summarize(filter(Ticket_2016, Ticket_2016$Violation_Code==21), count= n(Ticket_2016$Violation_Code))
+head(fine_2016_topviol1)
+fine_2016_topviol1.select("count").show()
+
+#*******************************************************************************************************
+sparkR.session.stop()
+
+#### Year 2017
+
+spark_path <- '/usr/local/spark'
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = spark_path)
+}
+library(SparkR, lib.loc = c(file.path(Sys.getenv("SPARK_HOME"), "R", "lib")))
+
+# initiating the spark session
+sparkR.session(master = "yarn-client", sparkConfig = list(spark.driver.memory = "1g"))
+
+# Before executing any hive-sql query from RStudio, you need to add a jar file in RStudio 
+sql("ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar")
+
+# install.packages("sparklyr")
+library(sparklyr)
+
+# importing data 2017 data
+
+nyc_2017 <- read.df("/common_folder/nyc_parking/Parking_Violations_Issued_-_Fiscal_Year_2017.csv", source = "CSV", inferSchema = "true", header = "true")
+										
+### Examine the data
+										
+# Q1. Find total number of tickets for each year.
+
+nrow(nyc_2017) # 10803028
+
+# Q2. Find out how many unique states the cars which got parking tickets came from. ####
+
+# remaing variabe `Summons Number` and `Registration State` 	
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017, "Summons Number", "Summons_Number")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Registration State", "Registration_State")
+state_ticket_counts <- SparkR::summarize(groupBy(nyc_2017_1, nyc_2017_1$Registration_State), count = n(nyc_2017_1$Registration_State))
+
+nrow(state_ticket_counts) ## 67 
+
+# Q3. Some parking tickets don’t have addresses on them, which is cause for concern. Find out how many such tickets there are.
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Street Code1", "Street_Code1")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Street Code2", "Street_Code2")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Street Code3", "Street_Code3")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Violation County", "Violation_County")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "House Number", "House_Number")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Street Name", "Street_Name")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Intersecting Street", "Intersecting_Street")
+ 
+createOrReplaceTempView(nyc_2017_1, "nyc_2017_tbl")
+
+address_null_2017 <- SparkR::sql("SELECT count(*) FROM nyc_2017_tbl where House_Number is null or Street_Name is null or House_Number in ('NA','') or Street_Name in ('NA','')")
+
+head(address_null_2017) # 2289944
+
+head(SparkR::sql("SELECT count(*) FROM nyc_2017_tbl where House_Number is null or Street_Name is null")) # 2289944
+
+### Aggregation tasks
+
+# Q1. How often does each violation code occur? (frequency of violation codes - find the top 5)
+
+# renaming `violation code` variable
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Violation Code", "Violation_Code")
+
+Violation_Code_count_2017 <- summarize(groupBy(nyc_2017_1, nyc_2017_1$Violation_Code) , count=n(nyc_2017_1$Violation_Code))
+
+head(arrange(Violation_Code_count_2017, desc(Violation_Code_count_2017$count)), n=5)
+
+#Violation_Code count
+# 1 21 1528588
+# 2 36 1400614
+# 3 38 1062304
+# 4 14  893498
+# 5 20  618593
+
+# Q2. How often does each vehicle body type get a parking ticket? How about the vehicle make? (find the top 5 for both)
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Vehicle Body Type", "Vehicle_Body_Type")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Vehicle Make", "Vehicle_Make")
+
+Vehicle_Body_Type_count_2017 <- summarize(groupBy(nyc_2017_1, nyc_2017_1$Vehicle_Body_Type) , count=n(nyc_2017_1$Vehicle_Body_Type))
+
+head(arrange(Vehicle_Body_Type_count_2017, desc(Vehicle_Body_Type_count_2017$count)), n=5)
+
+# Vehicle_Body_Type count
+# SUBN 3719802
+# 4DSD 3082020
+# VAN 1411970
+# DELV  687330
+# SDN  438191
+
+Vehicle_Make_count_2017 <- summarize(groupBy(nyc_2017_1, nyc_2017_1$Vehicle_Make) , count=n(nyc_2017_1$Vehicle_Make))
+
+head(arrange(Vehicle_Make_count_2017, desc(Vehicle_Make_count_2017$count)), n=5)
+
+# Vehicle_Make count
+# 1 FORD 1280958
+# 2 TOYOT 1211451
+# 3 HONDA 1079238
+# 4 NISSA 918590
+# 5 CHEVR 714655
+
+# Q3. A precinct is a police station that has a certain zone of the city under its command. Find the (5 highest) frequencies of:
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Violation Precinct", "Violation_Precinct")
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Issuer Precinct", "Issuer_Precinct")
+
+Violation_Precinct_count_2017 <- summarize(groupBy(nyc_2017_1, nyc_2017_1$Violation_Precinct) , count=n(nyc_2017_1$Violation_Precinct))
+
+head(arrange(Violation_Precinct_count_2017, desc(Violation_Precinct_count_2017$count)), n=5)
+
+
+# Violation_Precinct count
+# 1 0 2072400
+# 2 19 535671
+# 3 14 352450
+# 4 1 331810
+# 5 18 306920
+
+Issuer_Precinct_count_2017 <- summarize(groupBy(nyc_2017_1, nyc_2017_1$Issuer_Precinct) , count=n(nyc_2017_1$Issuer_Precinct))
+
+head(arrange(Issuer_Precinct_count_2017, desc(Issuer_Precinct_count_2017$count)), n=5)
+
+# Issuer_Precinct   count
+# 1 0 2388479
+# 2 19 521513
+# 3 14 344977
+# 4 1 321170
+# 5 18 296553
+
+# Q4. Find the violation code frequency across 3 precincts which have issued the most number of tickets - 
+
+createOrReplaceTempView(nyc_2017_1, "nyc_2017_tbl")
+
+Issuer_Precinct_Violation_Code_count <- SparkR::sql("SELECT Issuer_Precinct,Violation_Code, count(*) as count from nyc_2017_tbl where Issuer_Precinct in (0,19,14) group by Issuer_Precinct,Violation_Code")
+
+head(arrange(Issuer_Precinct_Violation_Code_count,desc(Issuer_Precinct_Violation_Code_count$count)))
+
+# Issuer_Precinct Violation_Code count
+# 1 0 36 1400614
+# 2 0 7 516389
+# 3 0 21 268591
+# 4 0 5 145642
+# 5 19 46 86390
+# 6 14 14 73837
+
+Violation_Code_Issuer_Precinct_top3_count <- SparkR::sql("SELECT Violation_Code, count(*) as count from nyc_2017_tbl where Issuer_Precinct in (0,19,14) group by Violation_Code")
+
+head(arrange(Violation_Code_Issuer_Precinct_top3_count,desc(Violation_Code_Issuer_Precinct_top3_count$count)))
+
+#  Violation_Code count
+# 1 36 1400614
+# 2 7 516390
+# 3 21 325435
+# 4 5 145643
+# 5 14 138488
+# 6 46 102459
+
+
+Violation_Code_Issuer_Precinct_top3_count_local <- SparkR::collect(arrange(Violation_Code_Issuer_Precinct_top3_count, Violation_Code_Issuer_Precinct_top3_count$Violation_Code))
+
+plot(Violation_Code_Issuer_Precinct_top3_count_local)
+
+Violation_Code_Issuer_Precinct_top3_count_local$percentage <- Violation_Code_Issuer_Precinct_top3_count_local$count * 100/sum(Violation_Code_Issuer_Precinct_top3_count_local$count)
+
+# plot shows that two of the Violation_Code (36 & 7) is have exceptionally high count.
+
+Violation_Code_count <- SparkR::sql("SELECT Violation_Code, count(*) as count FROM nyc_2017_tbl group by Violation_Code order by count desc")
+
+nrow(Violation_Code_count) #100
+
+Violation_Code_count_local <- SparkR::collect(arrange(Violation_Code_count,Violation_Code_count$count))
+
+plot(Violation_Code_count_local)
+
+Violation_Code_count_local$percentage <- Violation_Code_count_local$count * 100/sum(Violation_Code_count_local$count)
+
+library(dplyr)
+
+Violation_Code_Issuer_Precinct_top3_count_local[Violation_Code_Issuer_Precinct_top3_count_local$Violation_Code %in% c(36,7),]
+
+# Violation_Code count percentage
+# 8 7 516390 15.86467
+# 37 36 1400614 43.03003
+
+Violation_Code_count_local[Violation_Code_count_local$Violation_Code %in% c(36,7),]
+
+# Violation_Code count percentage
+# 91 7 516395 4.780095
+# 99 36 1400614 12.965013
+
+# Violation_Code 36 and 7 are common(among top 6) , however Violation_Code the percentage share in top 3 Issuer_Precinct is way high than overall share.
+
+# Q5 You’d want to find out the properties of parking violations across different times of the day:
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Violation Time", "Violation_Time")
+
+createOrReplaceTempView(nyc_2017_1, "nyc_2017_tbl")
+
+head(SparkR::sql("select count(*) from nyc_2017_tbl where Violation_Time is null or length(Violation_Time)<>5 or upper(substr(Violation_Time,-1)) not in ('A','P') or substr(Violation_Time,1,2) not in ('00','01','02','03','04','05','06','07','08','09','10','11','12')"))
+# 219
+
+Violation_Code_Time_bin_2017 <- SparkR::sql("SELECT Summons_Number, Violation_Code , case when substring(Violation_Time,1,2) in ('00','01','02','03','12') and upper(substring(Violation_Time,-1))='A' then 1 
+                                            when substring(Violation_Time,1,2) in ('04','05','06','07') and upper(substring(Violation_Time,-1))='A' then 2
+                                            when substring(Violation_Time,1,2) in ('08','09','10','11') and upper(substring(Violation_Time,-1))='A' then 3
+                                            when substring(Violation_Time,1,2) in ('12','00','01','02','03' ) and upper(substring(Violation_Time,-1))='P' then 4
+                                            when substring(Violation_Time,1,2) in ('04','05','06','07') and upper(substring(Violation_Time,-1))='P' then 5
+                                            when substring(Violation_Time,1,2) in ('08','09','10','11') and upper(substring(Violation_Time,-1))='P' then 6
+                                            else null end as Violation_Time_bin from nyc_2017_tbl where Violation_Time is not null or (length(Violation_Time)=5 and 
+                                            upper(substring(Violation_Time,-1)) in ('A','P') and substring(Violation_Time,1,2) in ('00','01','02','03','04','05','06','07','08','09','10','11','12'))")
+
+createOrReplaceTempView(Violation_Code_Time_bin_2017, "Violation_Code_Time_bin_2017_tbl")
+
+Violation_Code_Time_count_2017 <- SparkR::sql("SELECT Violation_Code,Violation_Time_bin, count(*) count from Violation_Code_Time_bin_2017_tbl group by Violation_Code,Violation_Time_bin")
+
+Violation_Code_Time_count_2017_local <- SparkR::collect(Violation_Code_Time_count_2017)
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==1,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin count
+# 1 21 1 77460
+# 2 40 1 50947
+# 3 78 1 32243
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==2,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin  count
+# 1 14 2 141276
+# 2 21 2 119469
+# 3 40 2 112186
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==3,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin count
+# 1 21 3 1182689
+# 2 36 3 751422
+# 3 38 3 346518
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==4,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin count
+# 1 36 4 588395
+# 2 38 4 462758
+# 3 37 4 337075
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==5,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin  count
+# 1 38 5 203232
+# 2 37 5 145784
+# 3 14 5 144749
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Time_bin==6,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin count
+# 1 7 6 65593
+# 2 38 6 47029
+# 3 14 6 44779
+
+# Overall
+
+arrange(summarise(group_by(Violation_Code_Time_count_2017_local,Violation_Code), Violation_Code_count=sum(count)), desc(Violation_Code_count)) %>% head(n=3)
+
+# Violation_Code Violation_Code_count
+# <int> <dbl>
+# 1 21 1528588
+# 2 36 1400614
+# 3 38 1062304
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Code==21,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin   count
+# 1 21 3 1182689
+# 2 21 4 148013
+# 3 21 2 119469
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Code==36,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin  count
+# 1 36 3 751422
+# 2 36 4 588395
+# 3 36 2 33939
+
+arrange(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Code==38,], desc(count)) %>% head(n=3)
+
+# Violation_Code Violation_Time_bin  count
+# 1 38 4 462758
+# 2 38 3 346518
+# 3 38 5 203232
+
+arrange(summarise(group_by(Violation_Code_Time_count_2017_local[Violation_Code_Time_count_2017_local$Violation_Code %in% c(21,38,14),],Violation_Time_bin), Violation_Time_bin_count=sum(count)), desc(Violation_Time_bin_count)) %>% head(n=3)
+
+# Violation_Time_bin Violation_Time_bin_count
+# <int> <dbl>
+# 1 3 1803495
+# 2 4 867102
+# 3 5 348532
+
+# Q6. Let’s try and find some seasonality in this data
+
+nyc_2017_1 <- withColumnRenamed(nyc_2017_1, "Issue Date", "Issue_Date")
+
+createOrReplaceTempView(nyc_2017_1, "nyc_2017_tbl")
+
+head(SparkR::sql("SELECT count(*) from nyc_2017_tbl where substring(Issue_Date,-4)<>'2017' or substring(Issue_Date,1,2) not in ('01','02','03','04','05','06','07','08','09','10','11','12')"))
+
+# 5371110
+
+head(SparkR::sql("SELECT count(*) from nyc_2017_tbl where substring(Issue_Date,-4)<>'2017'"))
+
+# 5371110
+
+head(SparkR::sql("SELECT count(*) from nyc_2017_tbl where substring(Issue_Date,1,2) not in ('01','02','03','04','05','06','07', '08','09','10','11','12')"))
+
+# 0
+
+head(SparkR::sql("SELECT substring(Issue_Date,-4),count(*) count from nyc_2017_tbl where substring(Issue_Date,-4)<>'2017' group by substring(Issue_Date,-4) order by count desc"), n=30)
+
+# substring(Issue_Date, -4, 2147483647) count                                
+# 1 2016 5368391
+# 2 2018 1057
+# 3 2019 472
+# 4 2015 419
+# 5 2000 185
+# 6 2014 120
+# 7 2012 87
+# 8 2013 70
+# 9 2027 50
+# 10 2010 48
+# 11 2026 24
+# 12 2020 22
+# 13 2021 22
+# 14 2011 22
+# 15 2007 18
+# 16 2030 12
+# 17 2006 8
+# 18 2028 8
+# 19 2025 6
+# 20 2023 5
+# 21 2031 5
+# 22 2008 4
+# 23 2069 4
+# 24 2022 4
+# 25 2024 3
+# 26 2009 3
+# 27 1991 3
+# 28 1972 2
+# 29 1973 2
+# 30 2033 2
+nrow(nyc_2017_1) # 10809233
+
+5371110/10803028
+[1] 0.4971856
+
+# almost 50% of year of issue date is not equal to, so we will consider there those 50% is 2017 only.
+
+Violation_Code_season_2017 <- SparkR::sql("SELECT Summons_Number, Violation_Code, case when substring(Issue_Date,1,2)  in ('01','02','03') then 1
+                                          when substring(Issue_Date,1,2)  in ('04','05','06') then 2
+                                          when substring(Issue_Date,1,2)  in ('07', '08','09') then 3
+                                          when substring(Issue_Date,1,2)  in ('10','11','12') then 4
+                                          else null end as season from nyc_2017_tbl")
+
+createOrReplaceTempView(Violation_Code_season_2017, "Violation_Code_season_2017_tbl")
+
+Violation_Code_season_count_2017 <- SparkR::sql("SELECT Violation_Code,season, count(*) count from Violation_Code_season_2017_tbl group by Violation_Code,season")
+
+Violation_Code_season_count_2017_local <- SparkR::collect(Violation_Code_season_count_2017)
+
+group_by(Violation_Code_season_count_2017_local, season) %>% summarise(season_ticket_count=sum(count)) %>% arrange(desc(season_ticket_count))
+
+# season season_ticket_count
+# <int> <dbl>
+# 1 2 3018840
+# 2 1 2671332
+# 3 4 2648920
+# 4 3 2463936
+
+arrange(Violation_Code_season_count_2017_local[Violation_Code_season_count_2017_local$season==1,], desc(count)) %>% head(n=3)
+
+# Violation_Code season  count
+# 1 21 1 374202
+# 2 36 1 348240
+# 3 38 1 287017
+
+arrange(Violation_Code_season_count_2017_local[Violation_Code_season_count_2017_local$season==2,], desc(count)) %>% head(n=3)
+
+# Violation_Code season  count
+# 1 21 2 421184
+# 2 36 2 369902
+# 3 38 2 266909
+
+arrange(Violation_Code_season_count_2017_local[Violation_Code_season_count_2017_local$season==3,], desc(count)) %>% head(n=3)
+
+# Violation_Code season  count
+# 1 21 3 385774
+# 2 38 3 244985
+# 3 36 3 239879
+
+arrange(Violation_Code_season_count_2017_local[Violation_Code_season_count_2017_local$season==4,], desc(count)) %>% head(n=3)
+
+# Violation_Code season  count
+# 1 36 4 442593
+# 2 21 4 347428
+# 3 38 4 263393
+
+# Q7. The fines collected from all the parking violation constitute a revenue source for the NYC police department. Let’s take an example of estimating that for the 3 most commonly occurring codes.
+
+top3_vio_cde_2017 <- summarize(groupBy(nyc_2017, nyc_2017$Violation_Code),count = n(nyc_2017$Violation_Code))
+showDF(arrange(top3_vio_cde_2017, desc(top3_vio_cde_2017$count)), numRows = 3, truncate = TRUE)
+                                                          
+# Violation_Code count
+# 21 1494775 Avg Fine = $55 - No parking where parking is not allowed
+# 36 1345192 Avg fine = $50 - Parking meter-Failing to show a receipt or tag in the windshield
+# 38 1049457 Avg fine = $115 -Standing or parking where standing is not allowed
+
+# find the total amount collected for the three violation codes with maximum tickets
+# State the code which has the highest total collection
+# The code below is not working, to be fixed ---TBD********
+fine_2017_topviol1 <-  summarize(filter(nyc_2017, nyc_2017$Violation_Code==21), count= n(nyc_2017$Violation_Code))
+head(fine_2017_topviol1)
+fine_2017_topviol1.select("count").show()
+
+sparkR.session.stop()
