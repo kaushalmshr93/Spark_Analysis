@@ -1,2 +1,390 @@
+==================================================================================================================================
+NY Parking Violations Analysis
 ===================================================================================================================================
+
+
 Problem Statement: Provided are 3 csv files that contain data for parking tickets collected by NYC Police Department for years 2015, 2016, 2017
+-------------------
+We will perform exploratory analysis on this data across the 3 years separately and compare them to find interesting trends/ patterns.
+
+Data Fields Used for Analysis :
+-----------------------------
+"Summons Number"                                            
+"Registration State"                                     
+"Issue Date"                        "Violation Code"                   
+"Vehicle Body Type"                 "Vehicle Make"                     
+"Violation Location"               
+"Violation Precinct"                "Issuer Precinct" 
+
+Technology used
+-----------------
+SparkR
+SQL library in SparkR
+
+Assumptions:
+--------------
+
+Duplicates for Summons Number could be found but we do not have enough business insight to decide which record among duplicate to delete, so keeping these records as is
+Violation code cannot be null and such records would be ignored for analysis
+Violation address is considered to be Violation Location which we assume would be uniquely defined for each of the geographic zones across NY
+Registration State has to be 2 digit character and cannot be numeric, will replace numeric value with highest state as defined in problem statement
+Time Bin Assumption : AM and PM 24 hours split as 0-4, 5-8 and 9-12 slots  for AM and PM so 6 groups
+Season Bin Assumption : 4 seasons in NY : Spring(Mar-May), Summer(Jun-Aug), Fall (Sep- Nov) and Winter (Dec-Feb)
+Ignore (no delete or edit) Violater and Issuer Precinct 0 for analysis
+
+EDA
+----
+Change blank space in column names to _ for using sql on the column names
+Replace Registration state 99 as state with max records
+Only identify records for violation location as null or empty, do not delete
+Remove records with violation time empty?? <<check this one >>
+
+======================================================================================================================================
+SECTION 1- DATA Analysis
+======================================================================================================================================
+
+1- Find the total number of tickets for each year
+   2015 - 11809233      |   2016 - 10626899       | 2017 - 10803028
+
+The number of tickets for each year seem to be in a similar range
+ 
+2 - Find out the number of unique states from where the cars that got parking tickets came from
+  2015  - 69    |   2016 - 68     | 2017 - 67
+ 
+3 - Check the tickets without violation location
+ 2015 - 1176914     |   2016 - 1868656       | 2017 - 2289944
+
+The Tickets without violation code seem to be increasing year on year
+
+======================================================================================================================================
+SECTION 2- Aggregation Tasks
+======================================================================================================================================  
+
+1 - Display the frequency of the top five violation codes
+
+#  |        2015          ||        2016          ||        2017          |
+#  |Violation_Code|  count||Violation_Code|  count||Violation_Code|  count|
+#  +--------------+-------++--------------+-------++--------------+-------+
+#  |            21|1186396||            21|1531587||            21|1528588|
+#  |            38|1046563||            36|1253512||            36|1400614|
+#  |            14| 731473||            38|1143696||            38|1062304|
+#  |            36| 633225||            14| 875614||            14| 893498|
+#  |            37| 582949||            37| 686610||            20| 618593|
+
+Code 21 seems to be the top violation code followed by 36, 38, 14 & 37
+For year 2015, top 5 violation codes make up 35% of the total data, while for 2016 & 2017, it makes up almost 51% of the total data.
+	
+	
+
+2A - How often does each 'vehicle body type' get a parking ticket?Find the top 5. 
+
+#  |        2015          ||        2016          ||        2017          |
+#  |VehicleBody   |  count||VehicleBody   |  count||VehicleBody   |  count|
+#  +--------------+-------++--------------+-------++--------------+-------+
+#  |          SUBN|2724600||          SUBN|3466037||          SUBN|3719802|
+#  |          4DSD|2418596||          4DSD|2992107||          4DSD|3082020|
+#  |           VAN|1234753||           VAN|1518303||           VAN|1411970|
+#  |          DELV| 648066||          DELV| 755282||          DELV| 687330|
+#  |           SDN| 358816||           SDN| 424043||           SDN| 438191|
+
+The top 5 vehicle body types are consistent year on year and the counts seem to be increasing for SUBN. 4DSD & SDN.
+
+
+	
+2B - How often does each 'vehicle make' get a parking ticket?Find the top 5.
+
+#  |        2015          ||        2016          ||        2017          |
+#  |VehicleMake   |  count||VehicleMake   |  count||VehicleMake   |  count|
+#  +--------------+-------++--------------+-------++--------------+-------+
+#  |          FORD|1086596||          FORD|1324774||          FORD|1280958|
+#  |         TOYOT| 881606||         TOYOT|1154790||         TOYOT|1211451|
+#  |         HONDA| 798107||         HONDA|1014074||         HONDA|1079238|
+#  |         NISSA| 655635||         NISSA| 834833||         NISSA| 918590|
+#  |         CHEVR| 641700||         CHEVR| 759663||         CHEVR| 714655|
+
+The vehicle make with the number of violations is consistent over the 3 years with Ford being the top violator. The counts seem to be increasing year on year.
+
+	
+3A - Find the (5 highest) frequency of tickets for 'Violation Precinct' (this is the precinct of the zone where the violation occurred)
+
+
+#  | 		2015	      || 	  2016	          || 	  2017	              |
+#  |Violation_Precinct|  count||Violation_Precinct|  count||Violation_Precinct|  count|
+#  +------------------+-------++------------------+-------++------------------+-------+
+#  |                 0|1176914||                 0|1868655||                 0|1868655|
+#  |                19| 445783||                19| 554465||                19| 535671|
+#  |                18| 304991||                18| 331704||                14| 352450|
+#  |                14| 295729||                14| 324467||                 1| 331810|
+#  |                 1| 243628||                 1| 303850||                18| 306920|
+#  |               114| 238611||               114| 291336||               114| 325986|
+	   
+				   
+We have ignored 0 as it doesn't correspond to any area code. precinct 19 has the highest number of violations followed by 18, 14, 1 & 114 
+	
+
+3B - Find the (5 highest) frequency of tickets for 'Issuer Precinct' (this is the precinct that issued the ticket)
+
+#  | 		2015	      || 	  2016	          || 	  2017	              |
+#  |Iss Precinct      |  count||Iss Precinct      |  count||Iss Precinct      |  count|
+#  +------------------+-------++------------------+-------++------------------+-------+
+#  |                 0|1354051||                 0|2140274||                 0|2388479|
+#  |                19| 431900||                19| 540569||                19| 521513|
+#  |                18| 298599||                18| 323132||                14| 344977|
+#  |                14| 285318||                14| 315311||                 1| 321170|
+#  |                 1| 236432||                 1| 295013||                18| 296553|
+#  |               114| 234238||               114| 286924||               114| 318824|
+
+			  
+The trends across the years are almost similar with violation precinct and issuer precinct being the same.
+
+
+4 - Find the violation code frequency across three precincts which have issued the most number of tickets - 
+do these precinct zones have an exceptionally high frequency of certain violation codes? Are these codes common across precincts? 
+
+#  | 	     2015        || 	     2016       || 	   2017         |
+#  |Violation_Code| count||Violation_Code| count||Violation_Code| count |
+#  +--------------+------++--------------+------++--------------+------+
+#  |            14|201700||            14|224025||            36|1400614|
+#  |            69|108115||            69|119857||            7 |516389 |
+#  |            38| 90712||            46| 98097||            21| 268591|
+#  |            37| 71673||            38| 97168||            5 | 145642|
+#  |            46| 58118||            37| 86040||            19| 86390 |
+#  |            31| 57436||            21| 64621||            14| 73837 |
+
+14, 69 & 38 are the most commonly occuring violation codes and they are similar across precincts
+
+Q5- For each time bin,  find the three most commonly occurring violations
+YEAR 2015
+
+# Bin 1 : 00:00 - 4:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#  |            21|49124|
+#  |            40|29317|
+#  |            78|25916|
+#  +--------------+-----+ 
+# Bin 2 : 04:00 - 08:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#| |           14|107499|
+#  |           21| 84070|
+#  |           40| 74415|
+#  +--------------+-----+
+# Bin 3 : 08:00 - 12:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            21|942623|
+# |            38|362355|
+# |            36|298860|
+#  +--------------+-----+
+# Bin 4 : 12:00 - 04:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|341349|
+# |            37|256656|
+# |            36|189331|
+# +--------------+------+
+# Bin 5 : 04:00 - 08:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|185678|
+# |            37|132260|
+# |            14|117129|
+#  +--------------+-----+
+# Bin 6 : 08:00 PM - 12:00 AM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|154524|
+# |            21|106700|
+# |            37| 88825|
+#  +--------------+-----+
+
+YEAR 2016
+
+Bin 1
+##+--------------+-----+                                                          
+##  |Violation_Code|count|
+##  +--------------+-----+
+##  |            21|67799|
+##  |            40|37262|
+##  |            78|29473|
+##  +--------------+-----+
+# Bin 2 : 04:00 - 08:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#| |           14|140111|
+#  |           21|114029|
+#  |           40| 91692|
+#  +--------------+-----+
+# Bin 3 : 08:00 - 12:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            21|1284358|
+# |            36|655669|
+# |            14|389865|
+#  +--------------+-----+
+# Bin 4 : 12:00 - 04:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            36|545717|
+# |            38|488302|
+# |            37|383361|
+# +--------------+------+
+# Bin 5 : 04:00 - 08:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|211267|
+# |            37|161655|
+# |            14|134976|
+#  +--------------+-----+
+# Bin 6 : 08:00 PM - 12:00 AM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            7 |60924|
+# |            38|53174|
+# |            40|44973|
+#  +--------------+-----+
+
+
+YEAR 2017
+
+Bin 1
+##+--------------+-----+                                                          
+##  |Violation_Code|count|
+##  +--------------+-----+
+##  |            21|77460|
+##  |            40|50947|
+##  |            78|32243|
+##  +--------------+-----+
+# Bin 2 : 04:00 - 08:00 AM 
+# +--------------+-----+                                                          
+#  |Violation_Code|count|
+#  +--------------+-----+
+#| |           14|141276|
+#  |           21|119469|
+#  |           40|112186|
+#  +--------------+-----+
+# Bin 3 : 08:00 - 12:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            21|1182689|
+# |            36|751422|
+# |            14|346518|
+#  +--------------+-----+
+# Bin 4 : 12:00 - 04:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            36|588395|
+# |            38|462758|
+# |            37|337075|
+# +--------------+------+
+# Bin 5 : 04:00 - 08:00 PM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            38|203232|
+# |            37|145784|
+# |            14|144749|
+#  +--------------+-----+
+# Bin 6 : 08:00 PM - 12:00 AM 
+# +--------------+-----+                                                          
+# |Violation_Code|count|
+# +--------------+-----+
+# |            7 |65593|
+# |            38|47029|
+# |            14|44779|
+#  +--------------+-----+
+
+For 2015, Violation code 21, 38 and 14 have the maximum frequency
+For 2016, Violation code 21, 36 and 38 have the maximum frequency
+For 2017, Violation code 21, 36 and 38 have the maximum frequency
+ 
+5 - For the 3 most commonly occurring violation codes, find the most common time bin
+The most common time bin the highest violation is 8 AM to 12 PM which is evident from the tables above.
+
+6A - Seasonality -find frequencies of tickets for each season
+2015
+-----
+Season Mar-May  38,21,14               
+	  
+Season Jun-Aug  21,38,14
+	  
+Season Sep-Nov  21,38,14
+	  
+Season Dec- Feb 21,38,14
+	  
+2016
+-----
+Season 1-3 : 21, 36,38
+	  
+Season 4-6 : 21,36,38
+	  
+Season 7-9 :21,38,14	
+	  
+Season 10-12 : 36,21, 38
+	  
+2017
+-----
+Season 1-3 : 21, 36,38
+	  
+Season 4-6 : 21,36,38
+	  
+Season 7-9 :21,38,36	
+	  
+Season 10-12 : 36,21, 38
+				  
+
+6B - find the three most common violations for each of these seasons
+   
+For all three years violation codes 21 & 38 seem to be most common
+
+   
+ 7A - fines collected - Find total occurrences of the three most common violation codes
+ 7B - find the total amount collected for the three violation codes with maximum tickets. State the code which has the highest total collection.
+ 7C - What can you intuitively infer from these findings?
+   Year 2015
+   ----------
+ #  +--------------+-------+                                                        
+#  |Violation_Code|  count| Total Fine || Avg Fine
+#  +--------------+-------+
+#  |            21|1186396|  6,52,51,780  | Avg Fine = $55 - No parking where parking is not allowed
+#  |            38|1046563| 5,23,28,150   | Avg fine = $50 - Parking meter-Failing to show a receipt or tag in the windshield
+#  |            14| 731473| 8,41,19,395   | Avg fine = $115 -Standing or parking where standing is not allowed
+#  +--------------+-------+
+# Total fine collected for Violation Code 14 is maximum
+TOTAL FINE : 1,40,01,93,562
+   Year 2016
+   ----------
+ #  +--------------+-------+                                                        
+#  |Violation_Code|  count| Total Fine || Avg Fine
+#  +--------------+-------+
+#  |            21|1531587|  
+#  |            36|1253512| 
+#  |            38| 1143696| 
+TOTAL FINE : 1,19,68,65,780
+
+
+   Year 2017
+   ----------
+ #  +--------------+-------+                                                        
+#  |Violation_Code|  count| 
+#  +--------------+-------+
+#  |            21|1528588|  
+#  |            36|1400614| 
+#  |            38| 1062304| 
+
+Total fine collected for violation code 14 is maximum
+Total fine for 2015 is maxiumum
